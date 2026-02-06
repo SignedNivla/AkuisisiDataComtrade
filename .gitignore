@@ -1,2 +1,4 @@
 .venv/
 .env
+trade_data.db
+coba.py

@@ -27,6 +27,36 @@ Base:DeclarativeBase = declarative_base()
 
 coco = CountryConverter()
 
+def chunk_list(data_list, chunk_size):
+    for i in range(0, len(data_list), chunk_size):
+        yield data_list[i:i + chunk_size]
+
+def get_valid_hs4_codes():
+    url = "https://comtradeapi.un.org/files/v1/app/reference/HS.json"
+    
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        
+        valid_codes = []
+        results = data.get('results', [])
+        
+        print(f"   Total referensi ditemukan: {len(results)} item")
+        
+        for item in results:
+            code = str(item.get('id'))
+            
+            if code.isdigit() and len(code) == 4:
+                valid_codes.append(code)
+        
+        print(f"✅ Berhasil menyaring {len(valid_codes)} kode HS-4 yang valid.")
+        return sorted(valid_codes)
+        
+    except Exception as e:
+        print(f"❌ Gagal ambil referensi: {e}")
+        return [str(i) for i in range(100, 9999) if len(str(i)) == 4]
+
 class Trade(Base):
     __tablename__ = 'trade'
     id = Column(INTEGER,primary_key=True, autoincrement=True)
@@ -113,7 +143,7 @@ def qtyUnitCodeConverter(unitCode):
     elif uc == '5': return 'u'
     else: return None
 
-def get_data_trade_annual(reporter_code:str, partner_code:str, tahun:str = date.today().year):
+def get_data_trade_annual(reporter_code:str, partner_code:str, hs_code:str,tahun:str = date.today().year):
     GET_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS?includeDesc=false'
     API_KEY = os.environ.get('API_KEY')
     params = {
@@ -124,7 +154,7 @@ def get_data_trade_annual(reporter_code:str, partner_code:str, tahun:str = date.
         'period':tahun,
         'format':'json',
         'freqCode':'A',
-        'cmdCode':'AG4'
+        'cmdCode':hs_code
     }
     header = {
         'Ocp-Apim-Subscription-Key': API_KEY
@@ -155,6 +185,8 @@ def main():
     print('Ingin memasukan data sampai tahun berapa?(2025)')
     eYearInput = input().strip()
 
+    avail_hs_codes = get_valid_hs4_codes()
+
     if not eYearInput: eYearInput = '2025'
 
     try:
@@ -172,44 +204,55 @@ def main():
         return
     
     total_data_saved = 0
+
     for curr_year in range(s_year,e_year+1):
         year_str = str(curr_year)
         year_success = 0
         print(f'\nMEMPROSES TAHUN {year_str}')
-        raw_data = get_data_trade_annual(rCodeM49,pCodeM49,year_str)
-        if not raw_data:
-            print('Tidak ada data yang diambil')
-            continue
-        print('Mulai validasi data')
 
-        for item in raw_data:
-            try:
-                clean_item = TradeModel(**item)
-                db_row = Trade(
-                    kode_alpha3_reporter = countryConvertertoIso(clean_item.reporterCode), #konversi
-                    provinsi_reporter = clean_item.provinsi_reporter,
-                    kota_reporter = clean_item.kota_reporter,
-                    kode_alpha3_partner= countryConvertertoIso(clean_item.partnerCode), #konversi
-                    provinsi_partner = clean_item.provinsi_partner,
-                    kota_partner= clean_item.kota_partner,
-                    bulan= str(clean_item.refMonth),
-                    tahun= str(clean_item.refYear),
-                    hscode= clean_item.classificationCode,
-                    id_sector= clean_item.cmdCode,
-                    vol= str(clean_item.qty),
-                    satuan= qtyUnitCodeConverter(clean_item.qtyUnitCode), #konversi
-                    tarif = clean_item.primaryValue,
-                    nilai= clean_item.netWgt,
-                    kode_sumber= clean_item.kode_sumber,
-                    kode_flow = clean_item.flowCode
-                )
-                session.add(db_row)
-            except ValidationError as e:
-                print(f'Data ditolak pydantic: {e}')
-            except Exception as e:
-                print(f'Error Databse: {e}')
-            year_success += 1
-        session.commit()
+        BATCH_SIZE = 20
+
+        batches = list(chunk_list(avail_hs_codes,BATCH_SIZE))
+
+        for i,batch in enumerate(batches):
+            hs_code_str = ",".join(batch)
+            batch_success = 0
+            print(f'Batch {i+1}/{len(batches)}(HS {batch[0]}-{batch[-1]})')
+            raw_data = get_data_trade_annual(rCodeM49,pCodeM49,hs_code_str,year_str)
+            if not raw_data:
+                print('Tidak ada data yang diambil')
+                time.sleep(1)
+                continue
+            print('Mulai validasi data')
+            for item in raw_data:
+                try:
+                    clean_item = TradeModel(**item)
+                    db_row = Trade(
+                        kode_alpha3_reporter = countryConvertertoIso(clean_item.reporterCode), #konversi
+                        provinsi_reporter = clean_item.provinsi_reporter,
+                        kota_reporter = clean_item.kota_reporter,
+                        kode_alpha3_partner= countryConvertertoIso(clean_item.partnerCode), #konversi
+                        provinsi_partner = clean_item.provinsi_partner,
+                        kota_partner= clean_item.kota_partner,
+                        bulan= str(clean_item.refMonth),
+                        tahun= str(clean_item.refYear),
+                        hscode= clean_item.classificationCode,
+                        id_sector= clean_item.cmdCode,
+                        vol= str(clean_item.qty),
+                        satuan= qtyUnitCodeConverter(clean_item.qtyUnitCode), #konversi
+                        tarif = clean_item.primaryValue,
+                        nilai= clean_item.netWgt,
+                        kode_sumber= clean_item.kode_sumber,
+                        kode_flow = clean_item.flowCode
+                    )
+                    session.add(db_row)
+                except ValidationError as e:
+                    print(f'Data ditolak pydantic: {e}')
+                except Exception as e:
+                    print(f'Error Databse: {e}')
+                batch_success += 1
+            session.commit()
+            year_success += batch_success
         total_data_saved += year_success
         print(f'\nTAHUN {year_str} SELESAI! {year_success} data berhasil disimpan')
     print(f'\n SELESAI! {total_data_saved} data berhasil disimpan')
