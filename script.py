@@ -185,6 +185,8 @@ def main():
     print('Ingin memasukan data sampai tahun berapa?(2025)')
     eYearInput = input().strip()
 
+    print('Memulai proses akuisisi data!')
+
     avail_hs_codes = get_valid_hs4_codes()
 
     if not eYearInput: eYearInput = '2025'
@@ -209,6 +211,7 @@ def main():
         year_str = str(curr_year)
         year_success = 0
         print(f'\nMEMPROSES TAHUN {year_str}')
+        start_time = time.time()
 
         BATCH_SIZE = 20
 
@@ -221,7 +224,7 @@ def main():
             raw_data = get_data_trade_annual(rCodeM49,pCodeM49,hs_code_str,year_str)
             if not raw_data:
                 print('Tidak ada data yang diambil')
-                time.sleep(1)
+                time.sleep(1.3)
                 continue
             print('Mulai validasi data')
             for item in raw_data:
@@ -253,8 +256,10 @@ def main():
                 batch_success += 1
             session.commit()
             year_success += batch_success
+            print(f'Batch {i+1} telah selesai dengan jumlah {batch_success} data berhasil disimpan')
         total_data_saved += year_success
-        print(f'\nTAHUN {year_str} SELESAI! {year_success} data berhasil disimpan')
+        end_time = time.time()
+        print(f'\nTAHUN {year_str} SELESAI dalam waktu {start_time-end_time}! {year_success} data berhasil disimpan')
     print(f'\n SELESAI! {total_data_saved} data berhasil disimpan')
     session.close()
 
