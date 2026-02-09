@@ -375,7 +375,7 @@ def main():
             time.sleep(1.5)
         total_data_saved += year_success
         end_time = time.time()
-        print(f'\nTAHUN {year_str} SELESAI dalam waktu {start_time-end_time}! {year_success} data berhasil disimpan')
+        print(f'\nTAHUN {year_str} SELESAI dalam waktu {end_time-start_time}! {year_success} data berhasil disimpan')
     print(f'\n SELESAI! {total_data_saved} data berhasil disimpan')
     session.close()
 
