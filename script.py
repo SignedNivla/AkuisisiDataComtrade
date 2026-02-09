@@ -1,3 +1,5 @@
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 import requests
 
 from typing import Optional, Union
@@ -22,7 +24,25 @@ load_dotenv()
 coco = CountryConverter()
 # CONSTANTS
 DB_FILE = "trade_data.db"
-HTTP_SESSION = requests.Session()
+
+def create_robust_session() -> Session:
+    session = requests.Session()
+
+    retry = Retry(
+        total=5,
+        backoff_factor=2,
+        allowed_methods=['HEAD','GET','OPTIONS'],
+        status_forcelist=[429,500,502,503,504]
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+
+    session.mount('https://',adapter=adapter)
+    session.mount('http://',adapter=adapter)
+    return session
+
+HTTP_SESSION = create_robust_session()
+
 API_KEY = os.environ.get('API_KEY')
 engine = create_engine(f'sqlite:///{DB_FILE}')
 Base:DeclarativeBase = declarative_base()
@@ -298,10 +318,10 @@ def main():
 
     processor = TradeBatchProcessor(session,convert_country)
 
-    print('Masukan negara asal(USDN Code)*: ')
+    print('Masukan negara asal(ISO Code)*: ')
     rCodeInput = input().strip().upper()
 
-    print('Masukan ke negara mana melakukan transaksi(USDN Code):')
+    print('Masukan ke negara mana melakukan transaksi(ISO Code):')
     pCodeInput = input().strip().upper()
 
     print('Ingin memasukan data dari tahun berapa?*')
@@ -352,6 +372,7 @@ def main():
 
             print(f"Batch {i+1} Done. Saved: {stats['success']}/{stats['total']}. Errors: {len(processor.errors)}")
             year_success += stats['success']
+            time.sleep(1.5)
         total_data_saved += year_success
         end_time = time.time()
         print(f'\nTAHUN {year_str} SELESAI dalam waktu {start_time-end_time}! {year_success} data berhasil disimpan')
