@@ -21,6 +21,7 @@ import os
 
 import time
 
+from sqlalchemy import event
 # ---CONFIG & SETUP---
 
 load_dotenv()
@@ -30,6 +31,14 @@ coco = CountryConverter()
 DB_FILE = "trade_data.db"
 engine = create_engine(f'sqlite:///{DB_FILE}')
 Base:DeclarativeBase = declarative_base()
+
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
+
 
 # --REQUEST API DECLARATION--
 def create_robust_session() -> Session:
@@ -326,7 +335,6 @@ class ComtradeClient:
     def fetch_annual_data(self,reporter:str,partner:str,hs_codes:str,year:str,flow_code:str = 'M,X') ->list[dict]:
         params = {
         'reporterCode':reporter,
-        'partnerCode':partner,
         'period':year,
         'cmdCode':hs_codes,
         'format':'json',
@@ -336,6 +344,10 @@ class ComtradeClient:
         headers = {
             'Ocp-Apim-Subscription-Key': self.api_key
         }
+
+        if partner and partner.upper() != "ALL":
+            params["partnerCode"] = partner
+
         try:
             response:requests.Response = self.session.get(self.BASE_URL,params=params,headers=headers)
 

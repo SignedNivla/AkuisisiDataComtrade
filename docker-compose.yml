@@ -1,0 +1,12 @@
+services:
+  scraper:
+    # Build image dari folder ini (.)
+    build: .
+    # Kasih nama image-nya
+    image: comtrade-scraper:v1
+    # Tempelkan folder laptop (.) ke folder container (/app)
+    volumes:
+      - .:/app
+    # Baca file .env
+    env_file:
+      - .env

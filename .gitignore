@@ -3,3 +3,5 @@
 trade_data.db
 coba.py
 coba.txt
+__pycache__/
+extraction.log
