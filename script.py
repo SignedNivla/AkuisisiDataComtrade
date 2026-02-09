@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 
 from datetime import date
 
+import logging
+
 from country_converter import CountryConverter
 
 import os
@@ -20,11 +22,16 @@ import os
 import time
 
 # ---CONFIG & SETUP---
+
 load_dotenv()
 coco = CountryConverter()
-# CONSTANTS
-DB_FILE = "trade_data.db"
 
+# --DATABASE--
+DB_FILE = "trade_data.db"
+engine = create_engine(f'sqlite:///{DB_FILE}')
+Base:DeclarativeBase = declarative_base()
+
+# --REQUEST API DECLARATION--
 def create_robust_session() -> Session:
     session = requests.Session()
 
@@ -44,10 +51,26 @@ def create_robust_session() -> Session:
 HTTP_SESSION = create_robust_session()
 
 API_KEY = os.environ.get('API_KEY')
-engine = create_engine(f'sqlite:///{DB_FILE}')
-Base:DeclarativeBase = declarative_base()
+
+class ComtradeAPIError(Exception):
+    '''
+    Error khusus jika API menolak request
+    '''
+    pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('extraction.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 # ---CONVERTER CLASS---
+
 class CountryCodeConverter:
     '''
     Class ini menangani konversi negara dengan Caching
@@ -94,10 +117,9 @@ class CountryCodeConverter:
                 
         self._iso3_cache[key] = result
         return result
-
-convert_country = CountryCodeConverter()
-
+    
 # ---DATABASE SCHEMA---
+
 class Trade(Base):
     __tablename__ = 'trade'
     id = Column(INTEGER,primary_key=True, autoincrement=True)
@@ -125,6 +147,7 @@ class Trade(Base):
     kota_partner= Column(VARCHAR(255))
 
 # ---DATA CLEANING LAYER---
+
 class TradeModel(BaseModel):
     '''
     Model ini bertugas 'membersihkan' data kotor dari API
@@ -169,6 +192,7 @@ class TradeModel(BaseModel):
         else: return None
 
 # ---PROCESSING BATCH---
+
 class TradeBatchProcessor:
     '''
     Class ini bertanggung jawab penuh atas siklus hidup
@@ -250,12 +274,15 @@ class TradeBatchProcessor:
             print(f'CRITICAL: Batch failed to save! {e}')
 
 # ---UTILS---
+
 # --DEFINING DATAS PER CHUNK--
+
 def chunk_list(data_list, chunk_size):
     for i in range(0,len(data_list),chunk_size):
         yield data_list[i:i+chunk_size]
 
 # --GETTING ALL AVAILABLE HS4 CODE--
+
 def get_valid_hs4_codes():
     url = "https://comtradeapi.un.org/files/v1/app/reference/HS.json"
     
@@ -283,40 +310,70 @@ def get_valid_hs4_codes():
         return [str(i) for i in range(100, 9999) if len(str(i)) == 4]
 
 # --REQUESTING API--
-def get_data_trade_annual(reporter_code:str, partner_code:str, hs_code:str,tahun:str = date.today().year):
-    GET_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS?includeDesc=false'
-    params = {
-        'reporterCode':reporter_code,
-        'partnerCode':partner_code,
 
-        'period':tahun,
+class ComtradeClient:
+    '''
+    Client khusus untuk menangani komunikasi dengan UN Comtrade API
+    '''
+    BASE_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS'
+    def __init__(self, session:Session, api_key:str):
+        self.session = session
+        self.api_key = api_key
+
+        if not api_key:
+            logger.warning('API Key tidak ditemukan!')
+    
+    def fetch_annual_data(self,reporter:str,partner:str,hs_codes:str,year:str,flow_code:str = 'M,X') ->list[dict]:
+        params = {
+        'reporterCode':reporter,
+        'partnerCode':partner,
+        'period':year,
+        'cmdCode':hs_codes,
         'format':'json',
         'freqCode':'A',
-        'cmdCode':hs_code
-    }
-    header = {
-        'Ocp-Apim-Subscription-Key': API_KEY
-    }
-    try:
-        response = HTTP_SESSION.get(GET_URL,params=params,headers=header)
-        if response.status_code == 200:
-            json_data:dict = response.json()
-            return json_data.get('data',[])
-        else:
-            print(f'Gagal mengambil data! Status: {response.status_code}')
-            print(f'Pesan: {response.text}')
-            return []
-    except Exception as e:
-        print(f'Error Request: {e}')
-        return []
+        'includeDesc':'false'
+        }
+        headers = {
+            'Ocp-Apim-Subscription-Key': self.api_key
+        }
+        try:
+            response:requests.Response = self.session.get(self.BASE_URL,params=params,headers=headers)
 
+            response.raise_for_status()
+
+            data = response.json()
+
+            if 'error' in data:
+                raise ComtradeAPIError(f"API Error message: {data['error']}")
+            
+            results = data.get('data',[])
+            logger.info(f"Fetched {len(results)} row for HS {hs_codes[:10]}...")
+            
+            return results
+        
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                logger.error("Rate Limit Hitting Hard!")
+            elif e.response.status_code == 401:
+                logger.critical("API Key Invalid atau Expired!")
+            raise ComtradeAPIError(f"HTTP failed:{e}")
+        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Connection Error: {e}")
+            raise ComtradeAPIError(f"Network Failed: {e}")
+            
+        except ValueError:
+            logger.error("Response is not valid JSON")
+            raise ComtradeAPIError("Invalid JSON Response")
+        
 def main():
     # SETUP DB
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
-
+    convert_country = CountryCodeConverter()
     processor = TradeBatchProcessor(session,convert_country)
+    api_client = ComtradeClient(session,API_KEY)
 
     print('Masukan negara asal(ISO Code)*: ')
     rCodeInput = input().strip().upper()
@@ -365,8 +422,8 @@ def main():
         for i,batch in enumerate(batches):
             hs_code_str = ",".join(batch)
             print(f'Batch {i+1}/{len(batches)}(HS {batch[0]}-{batch[-1]})')
-
-            raw_data = get_data_trade_annual(rCodeM49,pCodeM49,hs_code_str,year_str)
+            
+            raw_data = api_client.fetch_annual_data(rCodeM49,pCodeM49,hs_code_str,year_str)
 
             stats = processor.process(raw_data)
 
