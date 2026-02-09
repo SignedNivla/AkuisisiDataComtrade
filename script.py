@@ -3,9 +3,9 @@ import requests
 from typing import Optional, Union
 
 from sqlalchemy import create_engine, Column, INTEGER,String,VARCHAR, Numeric
-from sqlalchemy.orm import declarative_base, sessionmaker, DeclarativeBase
+from sqlalchemy.orm import declarative_base, sessionmaker, DeclarativeBase, Session
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
 from dotenv import load_dotenv
 
@@ -22,59 +22,74 @@ load_dotenv()
 coco = CountryConverter()
 # CONSTANTS
 DB_FILE = "trade_data.db"
-GET_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS?includeDesc=false'
+HTTP_SESSION = requests.Session()
 API_KEY = os.environ.get('API_KEY')
 engine = create_engine(f'sqlite:///{DB_FILE}')
 Base:DeclarativeBase = declarative_base()
 
-
-def chunk_list(data_list, chunk_size):
-    for i in range(0, len(data_list), chunk_size):
-        yield data_list[i:i + chunk_size]
-
-def get_valid_hs4_codes():
-    url = "https://comtradeapi.un.org/files/v1/app/reference/HS.json"
+# ---CONVERTER CLASS---
+class CountryCodeConverter:
+    '''
+    Class ini menangani konversi negara dengan Caching
+    Hanya memanggil library 'CountryConverter' jika kode belum pernah dilihat sebelumnya.
+    '''
+    def __init__(self):
+        print('Memulai Engine Country Converter...')
+        self.coco:CountryConverter = CountryConverter()
+        # Memory Cache {'InputCode':'OutputCode'}
+        self._iso3_cache:dict[str,str] = {}
+        self._m49_cache:dict[str,str] = {}
     
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        
-        valid_codes = []
-        results = data.get('results', [])
-        
-        print(f"   Total referensi ditemukan: {len(results)} item")
-        
-        for item in results:
-            code = str(item.get('id'))
-            
-            if code.isdigit() and len(code) == 4:
-                valid_codes.append(code)
-        
-        print(f"✅ Berhasil menyaring {len(valid_codes)} kode HS-4 yang valid.")
-        return sorted(valid_codes)
-        
-    except Exception as e:
-        print(f"❌ Gagal ambil referensi: {e}")
-        return [str(i) for i in range(100, 9999) if len(str(i)) == 4]
+    def to_m49(self, iso_code) -> str:
+        key = str(iso_code).strip()
 
+        if key in self._m49_cache:
+            return self._m49_cache[key]
+        
+        if key == 'WLD':
+            result = '0'
+        else:
+            try:
+                result = self.coco.convert(names = key,src = 'ISO3',to = 'UNCode')
+            except Exception:
+                result = None
+
+        self._m49_cache[key] = result
+        return result
+        
+    def to_iso3(self, m49_code) -> str:
+        key = str(m49_code).strip()
+
+        if key in self._iso3_cache:
+            return self._iso3_cache[key]
+        
+        if key == '0':
+            result = 'WLD'
+        else:
+            try:
+                result = self.coco.convert(names = key,src = 'UNCode',to = 'ISO3')
+                if len(result) > 3:result = key
+            except Exception:
+                result = key
+                
+        self._iso3_cache[key] = result
+        return result
+
+convert_country = CountryCodeConverter()
+
+# ---DATABASE SCHEMA---
 class Trade(Base):
     __tablename__ = 'trade'
     id = Column(INTEGER,primary_key=True, autoincrement=True)
 
     kode_alpha3_reporter = Column(String(3),nullable=False)
-    provinsi_reporter = Column(VARCHAR(255))
-    kota_reporter = Column(VARCHAR(255))
-
     kode_alpha3_partner= Column(String(3), nullable= False)
-    provinsi_partner = Column(VARCHAR(255))
-    kota_partner= Column(VARCHAR(255))
 
-    bulan= Column(VARCHAR(255), nullable = False)
-    tahun= Column(VARCHAR(255), nullable=False)
+    bulan= Column(VARCHAR(10), nullable = False)
+    tahun= Column(VARCHAR(4), nullable=False)
     
-    hscode= Column(VARCHAR(255),nullable=False)
-    id_sector= Column(VARCHAR(255),nullable=False)
+    id_sector= Column(VARCHAR(10),nullable=False)
+    hscode= Column(VARCHAR(20),nullable=False)
     
     vol= Column(VARCHAR(255))
     satuan= Column(VARCHAR(255))
@@ -84,12 +99,20 @@ class Trade(Base):
     kode_sumber= Column(String(3),nullable=False)
     kode_flow = Column(String(1),nullable=False)
 
+    provinsi_reporter = Column(VARCHAR(255))
+    kota_reporter = Column(VARCHAR(255))
+    provinsi_partner = Column(VARCHAR(255))
+    kota_partner= Column(VARCHAR(255))
+
+# ---DATA CLEANING LAYER---
 class TradeModel(BaseModel):
+    '''
+    Model ini bertugas 'membersihkan' data kotor dari API
+    sebelum disentuh oleh logika database.
+    '''
     reporterCode:Union[int,str] #kode_alpha3_reporter
-    
 
     partnerCode:Union[int,str] #kode_alpha3_partner
-   
 
     refMonth:Union[int,str] #bulan
     refYear:Union[int,str] #tahun
@@ -112,45 +135,138 @@ class TradeModel(BaseModel):
     kode_sumber:str = '5'
     flowCode:str
 
-class CountryConverter:
-    m49_code:str = None
-    iso_code:str = None
-    plain:str = None
-    def countryConvertertoM49(self) -> str:
-        self.coco = CountryConverter()
-        try:
-            if str(self.iso_code) == '0': return '0'
-            return coco.convert(names=str(self.iso_code), src='ISO3', to='UNCode')
-        except:
-            return None
-    def countryConvertertoIso(self) -> str:
-        try:
-            if str(self.m49_code) == '0': return 'WLD'
-            result = coco.convert(names=str(self.m49_code), src='UNCode', to='ISO3')
-            if isinstance(result,list):
-                result = result[0]
-            if len(result)>3:
-                return str(self.m49_code)
+    @field_validator('qty','primaryValue','netWgt',mode='before')
+    def sanitize_numbers(cls,v):
+        if v == '' or v is None:
+            return 0.0
+        return float(v)
+    
+    @field_validator('qtyUnitCode',mode='before')
+    def convert_unit(cls,v):
+        v_str = str(v)
+        if v_str == '8': return 'kg' 
+        elif v_str == '5': return 'u'
+        else: return None
+
+# ---PROCESSING BATCH---
+class TradeBatchProcessor:
+    '''
+    Class ini bertanggung jawab penuh atas siklus hidup
+    pemrosesan satu batch data
+    '''
+    def __init__(self, session:Session, mapper:CountryCodeConverter):
+        self.session = session
+        self.mapper = mapper
+
+        self.total_processed = 0
+        self.total_saved = 0
+        self.errors = []
+    
+    def process(self, raw_data_list:list[dict])->dict:
+        '''
+        Pintu masuk data. Mengembalikan ringkasan hasil kerja
+        '''
+        batch_payload = []
+        for item in raw_data_list:
+            self.total_processed += 1
+            clean_row = self._transform(item)
+            if clean_row:
+                batch_payload.append(clean_row)
             else:
-                return result
-        except:
-            return m49_code
-    def __init__(self,plain:Optional[str] = None,m49_code:Optional[str] = None,iso_code:Optional[str]= None):
-        if m49_code:
-            self.m49_code = iso_code
-            iso_code = self.countryConvertertoIso(m49_code)
+                pass
         
+        if batch_payload:
+            self._load_to_db(batch_payload)
+        
+        return{
+            'total':self.total_processed,
+            'success':self.total_saved,
+            'failed':self.total_processed - self.total_saved,
+            'sample_error': self.errors[0] if self.errors else None
+        }
 
-def qtyUnitCodeConverter(unitCode):
-    uc = str(unitCode)
-    if uc == '8': return 'kg' 
-    elif uc == '5': return 'u'
-    else: return None
+    def _transform(self, raw_item:dict)->dict:
+        try:
+            clean = TradeModel(**raw_item)
+            rep_iso = self.mapper.to_iso3(clean.reporterCode)
+            part_iso = self.mapper.to_iso3(clean.partnerCode)
 
+            return {
+                'kode_alpha3_reporter' : rep_iso,
+                'kode_alpha3_partner' : part_iso,
+                'bulan' : str(clean.refMonth).zfill(2),
+                'tahun' : str(clean.refYear),
+                'hscode' : clean.classificationCode,
+                'id_sector' : clean.cmdCode,
+                'vol' : str(clean.qty),
+                'satuan' : clean.qtyUnitCode,
+                'tarif' : clean.primaryValue,
+                'nilai' : clean.netWgt,
+                'kode_sumber' : clean.kode_sumber,
+                'kode_flow' : clean.flowCode,
+                'provinsi_reporter' : clean.provinsi_reporter,
+                'kota_reporter' : clean.kota_reporter,
+                'provinsi_partner' : clean.provinsi_partner,
+                'kota_partner' : clean.kota_partner,
+            }
+        except ValidationError as e:
+            self.errors.append(f'Validation Error: {str(e)}')
+            return None
+        except Exception as e:
+            self.errors.append(f'Unexpected Error: {str(e)}')
+            return None
+
+    def _load_to_db(self, payload:list[dict]):
+        '''
+        Logika penyimpanan data dan interaksi dengan database
+        '''
+        try:
+            self.session.bulk_insert_mappings(Trade,payload)
+            self.session.commit()
+            self.total_saved += len(payload)
+        except Exception as e:
+            self.session.rollback()
+            self.errors.append(f'DB Insert Error:{str(e)}')
+            print(f'CRITICAL: Batch failed to save! {e}')
+
+# ---UTILS---
+# --DEFINING DATAS PER CHUNK--
+def chunk_list(data_list, chunk_size):
+    for i in range(0,len(data_list),chunk_size):
+        yield data_list[i:i+chunk_size]
+
+# --GETTING ALL AVAILABLE HS4 CODE--
+def get_valid_hs4_codes():
+    url = "https://comtradeapi.un.org/files/v1/app/reference/HS.json"
+    
+    try:
+        response = HTTP_SESSION.get(url)
+        response.raise_for_status()
+        data = response.json()
+        
+        valid_codes = []
+        results = data.get('results', [])
+        
+        print(f"   Total referensi ditemukan: {len(results)} item")
+        
+        for item in results:
+            code = str(item.get('id'))
+            
+            if code.isdigit() and len(code) == 4:
+                valid_codes.append(code)
+        
+        print(f"✅ Berhasil menyaring {len(valid_codes)} kode HS-4 yang valid.")
+        return sorted(valid_codes)
+        
+    except Exception as e:
+        print(f"❌ Gagal ambil referensi: {e}")
+        return [str(i) for i in range(100, 9999) if len(str(i)) == 4]
+
+# --REQUESTING API--
 def get_data_trade_annual(reporter_code:str, partner_code:str, hs_code:str,tahun:str = date.today().year):
+    GET_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS?includeDesc=false'
     params = {
         'reporterCode':reporter_code,
-
         'partnerCode':partner_code,
 
         'period':tahun,
@@ -162,7 +278,7 @@ def get_data_trade_annual(reporter_code:str, partner_code:str, hs_code:str,tahun
         'Ocp-Apim-Subscription-Key': API_KEY
     }
     try:
-        response = requests.get(GET_URL,params=params,headers=header)
+        response = HTTP_SESSION.get(GET_URL,params=params,headers=header)
         if response.status_code == 200:
             json_data:dict = response.json()
             return json_data.get('data',[])
@@ -179,6 +295,8 @@ def main():
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
+
+    processor = TradeBatchProcessor(session,convert_country)
 
     print('Masukan negara asal(USDN Code)*: ')
     rCodeInput = input().strip().upper()
@@ -205,8 +323,8 @@ def main():
         print("Error: Tahun harus berupa angka.")
         return
 
-    rCodeM49 = countryConvertertoM49(rCodeInput)
-    pCodeM49 = countryConvertertoM49(pCodeInput) if pCodeInput else None
+    rCodeM49 = convert_country.to_m49(rCodeInput)
+    pCodeM49 = convert_country.to_m49(pCodeInput) if pCodeInput else None
     
     if not rCodeM49:
         print('Error: Kode negara asal tidak valid')
@@ -226,44 +344,14 @@ def main():
 
         for i,batch in enumerate(batches):
             hs_code_str = ",".join(batch)
-            batch_success = 0
             print(f'Batch {i+1}/{len(batches)}(HS {batch[0]}-{batch[-1]})')
+
             raw_data = get_data_trade_annual(rCodeM49,pCodeM49,hs_code_str,year_str)
-            if not raw_data:
-                print('Tidak ada data yang diambil')
-                time.sleep(1.3)
-                continue
-            print('Mulai validasi data')
-            for item in raw_data:
-                try:
-                    clean_item = TradeModel(**item)
-                    db_row = Trade(
-                        kode_alpha3_reporter = countryConvertertoIso(clean_item.reporterCode), #konversi
-                        provinsi_reporter = clean_item.provinsi_reporter,
-                        kota_reporter = clean_item.kota_reporter,
-                        kode_alpha3_partner= countryConvertertoIso(clean_item.partnerCode), #konversi
-                        provinsi_partner = clean_item.provinsi_partner,
-                        kota_partner= clean_item.kota_partner,
-                        bulan= str(clean_item.refMonth),
-                        tahun= str(clean_item.refYear),
-                        hscode= clean_item.classificationCode,
-                        id_sector= clean_item.cmdCode,
-                        vol= str(clean_item.qty),
-                        satuan= qtyUnitCodeConverter(clean_item.qtyUnitCode), #konversi
-                        tarif = clean_item.primaryValue,
-                        nilai= clean_item.netWgt,
-                        kode_sumber= clean_item.kode_sumber,
-                        kode_flow = clean_item.flowCode
-                    )
-                    session.add(db_row)
-                except ValidationError as e:
-                    print(f'Data ditolak pydantic: {e}')
-                except Exception as e:
-                    print(f'Error Databse: {e}')
-                batch_success += 1
-            session.commit()
-            year_success += batch_success
-            print(f'Batch {i+1} telah selesai dengan jumlah {batch_success} data berhasil disimpan')
+
+            stats = processor.process(raw_data)
+
+            print(f"Batch {i+1} Done. Saved: {stats['success']}/{stats['total']}. Errors: {len(processor.errors)}")
+            year_success += stats['success']
         total_data_saved += year_success
         end_time = time.time()
         print(f'\nTAHUN {year_str} SELESAI dalam waktu {start_time-end_time}! {year_success} data berhasil disimpan')
