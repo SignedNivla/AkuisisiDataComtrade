@@ -17,15 +17,16 @@ import os
 
 import time
 
+# ---CONFIG & SETUP---
 load_dotenv()
-
+coco = CountryConverter()
+# CONSTANTS
 DB_FILE = "trade_data.db"
-
+GET_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS?includeDesc=false'
+API_KEY = os.environ.get('API_KEY')
 engine = create_engine(f'sqlite:///{DB_FILE}')
-
 Base:DeclarativeBase = declarative_base()
 
-coco = CountryConverter()
 
 def chunk_list(data_list, chunk_size):
     for i in range(0, len(data_list), chunk_size):
@@ -111,31 +112,34 @@ class TradeModel(BaseModel):
     kode_sumber:str = '5'
     flowCode:str
 
-
-Base.metadata.create_all(engine)
-
-Session = sessionmaker(bind=engine)
-session = Session()
-
-def countryConvertertoIso(m49_code) -> str:
-    try:
-        if str(m49_code) == '0': return 'WLD'
-        result = coco.convert(names=str(m49_code), src='UNCode', to='ISO3')
-        if isinstance(result,list):
-            result = result[0]
-        if len(result)>3:
-            return str(m49_code)
-        else:
-            return result
-    except:
-        return m49_code
-
-def countryConvertertoM49(iso_code) -> str:
-    try:
-        if str(iso_code) == '0': return '0'
-        return coco.convert(names=str(iso_code), src='ISO3', to='UNCode')
-    except:
-        return None
+class CountryConverter:
+    m49_code:str = None
+    iso_code:str = None
+    plain:str = None
+    def countryConvertertoM49(self) -> str:
+        self.coco = CountryConverter()
+        try:
+            if str(self.iso_code) == '0': return '0'
+            return coco.convert(names=str(self.iso_code), src='ISO3', to='UNCode')
+        except:
+            return None
+    def countryConvertertoIso(self) -> str:
+        try:
+            if str(self.m49_code) == '0': return 'WLD'
+            result = coco.convert(names=str(self.m49_code), src='UNCode', to='ISO3')
+            if isinstance(result,list):
+                result = result[0]
+            if len(result)>3:
+                return str(self.m49_code)
+            else:
+                return result
+        except:
+            return m49_code
+    def __init__(self,plain:Optional[str] = None,m49_code:Optional[str] = None,iso_code:Optional[str]= None):
+        if m49_code:
+            self.m49_code = iso_code
+            iso_code = self.countryConvertertoIso(m49_code)
+        
 
 def qtyUnitCodeConverter(unitCode):
     uc = str(unitCode)
@@ -144,8 +148,6 @@ def qtyUnitCodeConverter(unitCode):
     else: return None
 
 def get_data_trade_annual(reporter_code:str, partner_code:str, hs_code:str,tahun:str = date.today().year):
-    GET_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS?includeDesc=false'
-    API_KEY = os.environ.get('API_KEY')
     params = {
         'reporterCode':reporter_code,
 
@@ -173,6 +175,11 @@ def get_data_trade_annual(reporter_code:str, partner_code:str, hs_code:str,tahun
         return []
 
 def main():
+    # SETUP DB
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
     print('Masukan negara asal(USDN Code)*: ')
     rCodeInput = input().strip().upper()
 
