@@ -4,7 +4,7 @@ import requests
 
 from typing import Optional, Union
 
-from sqlalchemy import create_engine, Column, INTEGER,String,VARCHAR, Numeric
+from sqlalchemy import create_engine, Column, INTEGER,String,VARCHAR, Numeric, select
 from sqlalchemy.orm import declarative_base, sessionmaker, DeclarativeBase, Session
 
 from pydantic import BaseModel, ValidationError, field_validator
@@ -100,6 +100,10 @@ class CountryCodeConverter:
         
         if key == 'WLD':
             result = '0'
+
+        if key == 'ALL': 
+            return 'ALL'
+
         else:
             try:
                 result = self.coco.convert(names = key,src = 'ISO3',to = 'UNCode')
@@ -282,41 +286,13 @@ class TradeBatchProcessor:
             self.errors.append(f'DB Insert Error:{str(e)}')
             print(f'CRITICAL: Batch failed to save! {e}')
 
-# ---UTILS---
 
+# ---UTILS---
 # --DEFINING DATAS PER CHUNK--
 
 def chunk_list(data_list, chunk_size):
     for i in range(0,len(data_list),chunk_size):
         yield data_list[i:i+chunk_size]
-
-# --GETTING ALL AVAILABLE HS4 CODE--
-
-def get_valid_hs4_codes():
-    url = "https://comtradeapi.un.org/files/v1/app/reference/HS.json"
-    
-    try:
-        response = HTTP_SESSION.get(url)
-        response.raise_for_status()
-        data = response.json()
-        
-        valid_codes = []
-        results = data.get('results', [])
-        
-        print(f"   Total referensi ditemukan: {len(results)} item")
-        
-        for item in results:
-            code = str(item.get('id'))
-            
-            if code.isdigit() and len(code) == 4:
-                valid_codes.append(code)
-        
-        print(f"✅ Berhasil menyaring {len(valid_codes)} kode HS-4 yang valid.")
-        return sorted(valid_codes)
-        
-    except Exception as e:
-        print(f"❌ Gagal ambil referensi: {e}")
-        return [str(i) for i in range(100, 9999) if len(str(i)) == 4]
 
 # --REQUESTING API--
 
@@ -325,8 +301,8 @@ class ComtradeClient:
     Client khusus untuk menangani komunikasi dengan UN Comtrade API
     '''
     BASE_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS'
-    def __init__(self, session:Session, api_key:str):
-        self.session = session
+    def __init__(self, api_key:str):
+        self.session = HTTP_SESSION
         self.api_key = api_key
 
         if not api_key:
@@ -339,7 +315,8 @@ class ComtradeClient:
         'cmdCode':hs_codes,
         'format':'json',
         'freqCode':'A',
-        'includeDesc':'false'
+        'includeDesc':'false',
+        'flowCode':flow_code
         }
         headers = {
             'Ocp-Apim-Subscription-Key': self.api_key
@@ -351,9 +328,13 @@ class ComtradeClient:
         try:
             response:requests.Response = self.session.get(self.BASE_URL,params=params,headers=headers)
 
+            if response.status_code == 403:
+                 logger.critical("⛔ QUOTA EXCEEDED (403). Script harus berhenti.")
+                 raise ComtradeAPIError("403 Quota Exceeded")
+
             response.raise_for_status()
 
-            data = response.json()
+            data:dict = response.json()
 
             if 'error' in data:
                 raise ComtradeAPIError(f"API Error message: {data['error']}")
@@ -378,75 +359,117 @@ class ComtradeClient:
             logger.error("Response is not valid JSON")
             raise ComtradeAPIError("Invalid JSON Response")
         
-def main():
-    # SETUP DB
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    session = Session()
-    convert_country = CountryCodeConverter()
-    processor = TradeBatchProcessor(session,convert_country)
-    api_client = ComtradeClient(session,API_KEY)
+class JobOrchestrator:
+    '''
+    Class ini bertanggung jawab terhadap menjalankan keseluruhan logika aplikasi
+    '''
+    def __init__(self):
+        Base.metadata.create_all(engine)
+        self.SessionLocal = sessionmaker(bind=engine)
+        self.country_converter = CountryCodeConverter()
+        self.client = ComtradeClient(os.getenv('API_KEY'))
 
-    print('Masukan negara asal(ISO Code)*: ')
-    rCodeInput = input().strip().upper()
+        self.all_hs_codes = self._get_valid_hs4_codes()
 
-    print('Masukan ke negara mana melakukan transaksi(ISO Code):')
-    pCodeInput = input().strip().upper()
-
-    print('Ingin memasukan data dari tahun berapa?*')
-    sYearInput = input().strip()
-    
-    print('Ingin memasukan data sampai tahun berapa?(2025)')
-    eYearInput = input().strip()
-
-    print('Memulai proses akuisisi data!')
-
-    avail_hs_codes = get_valid_hs4_codes()
-
-    if not eYearInput: eYearInput = '2025'
-
-    try:
-        s_year = int(sYearInput)
-        e_year = int(eYearInput)
-    except ValueError:
-        print("Error: Tahun harus berupa angka.")
-        return
-
-    rCodeM49 = convert_country.to_m49(rCodeInput)
-    pCodeM49 = convert_country.to_m49(pCodeInput) if pCodeInput else None
-    
-    if not rCodeM49:
-        print('Error: Kode negara asal tidak valid')
-        return
-    
-    total_data_saved = 0
-
-    for curr_year in range(s_year,e_year+1):
-        year_str = str(curr_year)
-        year_success = 0
-        print(f'\nMEMPROSES TAHUN {year_str}')
-        start_time = time.time()
-
-        BATCH_SIZE = 20
-
-        batches = list(chunk_list(avail_hs_codes,BATCH_SIZE))
-
-        for i,batch in enumerate(batches):
-            hs_code_str = ",".join(batch)
-            print(f'Batch {i+1}/{len(batches)}(HS {batch[0]}-{batch[-1]})')
+    def _get_valid_hs4_codes(self) -> list[str]:
+        url = "https://comtradeapi.un.org/files/v1/app/reference/HS.json"
+        
+        try:
+            response:requests.Response = HTTP_SESSION.get(url)
+            response.raise_for_status()
+            data:dict = response.json()
             
-            raw_data = api_client.fetch_annual_data(rCodeM49,pCodeM49,hs_code_str,year_str)
+            results = data.get('results', [])
+            
+            print(f"   Total referensi ditemukan: {len(results)} item")
+            
+            return sorted([str(item['id']) for item in results if str(item['id']).isdigit() and len(str(item['id'])) == 4])
+            
+        except Exception as e:
+            print(f"❌ Gagal ambil referensi: {e}")
+            return [str(i) for i in range(100, 9999) if len(str(i)) == 4]
+        
+    def _get_existing_code(self, reporter:str, year:str)->set[str]:
+        session = self.SessionLocal()
+        try:
+            stmt = select(Trade.id_sector).where(
+                Trade.kode_alpha3_reporter == self.country_converter.to_iso3(reporter),
+                Trade.tahun == year
+            ).distinct()
+            result = session.execute(stmt).scalars().all()
+            return set(result)
+        except Exception as e:
+            logger.error(f"Gagal cek existing data: {e}")
+            return set()
+        finally:
+            session.close()
 
-            stats = processor.process(raw_data)
+    def run(self, reporters_iso: list[str], partner_iso: str, start_year: int, end_year: int):
+        
+        for r_iso in reporters_iso:
+            r_code = self.country_converter.to_m49(r_iso)
+            p_code = self.country_converter.to_m49(partner_iso) if partner_iso else None
+            
+            if not r_code: continue
+            
+            print(f"\n🚀 START REPORTER: {r_iso} ({r_code}) -> PARTNER: {partner_iso}")
 
-            print(f"Batch {i+1} Done. Saved: {stats['success']}/{stats['total']}. Errors: {len(processor.errors)}")
-            year_success += stats['success']
-            time.sleep(1.5)
-        total_data_saved += year_success
-        end_time = time.time()
-        print(f'\nTAHUN {year_str} SELESAI dalam waktu {end_time-start_time}! {year_success} data berhasil disimpan')
-    print(f'\n SELESAI! {total_data_saved} data berhasil disimpan')
-    session.close()
+            for year in range(start_year, end_year + 1):
+                year_str = str(year)
+                
+                # 1. SMART FILTER (Checkpoint)
+                print(f"   🔎 Menganalisis Database untuk Tahun {year_str}...")
+                existing_hs = self._get_existing_code(r_code, year_str)
+                
+                # Set Difference: Apa yang kita mau - Apa yang sudah ada
+                target_hs = sorted(list(set(self.all_hs_codes) - existing_hs))
+                
+                if not target_hs:
+                    print(f"   ✅ Tahun {year_str} sudah LENGKAP ({len(existing_hs)} codes). Skip.")
+                    continue
+                
+                print(f"   📉 Data Existing: {len(existing_hs)}. Target Fetch: {len(target_hs)} codes.")
+
+                # 2. BATCHING
+                # Gunakan Batch Size 5 (Aman untuk China) atau 1 (Sangat Aman)
+                BATCH_SIZE = 5 
+                chunks = [target_hs[i:i + BATCH_SIZE] for i in range(0, len(target_hs), BATCH_SIZE)]
+                
+                db_session = self.SessionLocal()
+                processor = TradeBatchProcessor(db_session, self.country_converter)
+
+                for i, batch in enumerate(chunks):
+                    hs_str = ",".join(batch)
+                    try:
+                        # Fetch
+                        raw = self.client.fetch_annual_data(r_code, p_code, hs_str, year_str)
+                        
+                        # Save
+                        count = processor.process(raw)
+                        print(f"      Batch {i+1}/{len(chunks)}: Fetched & Saved {count['success']} rows.")
+                        
+                        # Anti-Rate Limit Sleep
+                        time.sleep(1.5) 
+
+                    except Exception as e:
+                        print(f"      ❌ Batch {i+1} Gagal: {e}")
+                        # Opsional: Break loop jika error Quota 403 biar gak spam
+                        if "403" in str(e): 
+                            print("      ⚠️ QUOTA HABIS. Berhenti.")
+                            return 
+
+                db_session.close()
+        
+def main():
+    reporters_env =  os.getenv("REPORTER_CODE", "IDN")
+    partner_env = os.getenv("PARTNER_CODE","ALL")
+    start_year = int(os.getenv("START_YEAR", "2023"))
+    end_year = int(os.getenv("END_YEAR", "2025"))
+    
+    reporters = [x.strip() for x in reporters_env.split(',')]
+    
+    orchestrator = JobOrchestrator()
+    orchestrator.run(reporters, partner_env, start_year, end_year)
 
 if __name__ == '__main__':
     main()
