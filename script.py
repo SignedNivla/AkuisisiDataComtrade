@@ -4,7 +4,7 @@ import requests
 
 from typing import Optional, Union
 
-from sqlalchemy import create_engine, Column, INTEGER,String,VARCHAR, Numeric
+from sqlalchemy import create_engine, Column, INTEGER,String,VARCHAR, Numeric, select
 from sqlalchemy.orm import declarative_base, sessionmaker, DeclarativeBase, Session
 
 from pydantic import BaseModel, ValidationError, field_validator
@@ -377,7 +377,19 @@ class ComtradeClient:
         except ValueError:
             logger.error("Response is not valid JSON")
             raise ComtradeAPIError("Invalid JSON Response")
-        
+
+def get_existing_code(db_session:Session,country_converter:CountryCodeConverter, reporter:str, year:str)->set[str]:
+        try:
+            stmt = select(Trade.id_sector).where(
+                Trade.kode_alpha3_reporter == country_converter.to_iso3(reporter),
+                Trade.tahun == year
+            ).distinct()
+            result = db_session.execute(stmt).scalars().all()
+            return set(result)
+        except Exception as e:
+            logger.error(f"Gagal cek existing data: {e}")
+            return set()
+
 def main():
     # SETUP DB
     Base.metadata.create_all(engine)
@@ -385,35 +397,26 @@ def main():
     session = Session()
     convert_country = CountryCodeConverter()
     processor = TradeBatchProcessor(session,convert_country)
-    api_client = ComtradeClient(session,API_KEY)
+    api_client = ComtradeClient(HTTP_SESSION,API_KEY)
 
-    print('Masukan negara asal(ISO Code)*: ')
-    rCodeInput = input().strip().upper()
-
-    print('Masukan ke negara mana melakukan transaksi(ISO Code):')
-    pCodeInput = input().strip().upper()
-
-    print('Ingin memasukan data dari tahun berapa?*')
-    sYearInput = input().strip()
-    
-    print('Ingin memasukan data sampai tahun berapa?(2025)')
-    eYearInput = input().strip()
-
-    print('Memulai proses akuisisi data!')
+    reporters_env =  os.getenv("REPORTER_CODE", "IDN")
+    partner_env = os.getenv("PARTNER_CODE","ALL")
+    start_year = int(os.getenv("START_YEAR", "2023"))
+    end_year = int(os.getenv("END_YEAR", "2025"))
 
     avail_hs_codes = get_valid_hs4_codes()
 
-    if not eYearInput: eYearInput = '2025'
+    if not end_year: end_year = '2025'
 
     try:
-        s_year = int(sYearInput)
-        e_year = int(eYearInput)
+        s_year = int(start_year)
+        e_year = int(end_year)
     except ValueError:
         print("Error: Tahun harus berupa angka.")
         return
 
-    rCodeM49 = convert_country.to_m49(rCodeInput)
-    pCodeM49 = convert_country.to_m49(pCodeInput) if pCodeInput else None
+    rCodeM49 = convert_country.to_m49(reporters_env)
+    pCodeM49 = convert_country.to_m49(partner_env) if partner_env else None
     
     if not rCodeM49:
         print('Error: Kode negara asal tidak valid')
@@ -429,7 +432,16 @@ def main():
 
         BATCH_SIZE = 20
 
-        batches = list(chunk_list(avail_hs_codes,BATCH_SIZE))
+        existing_hs = get_existing_code(session,convert_country,reporters_env, year_str)
+            
+            # Set Difference: Apa yang kita mau - Apa yang sudah ada
+        target_hs = sorted(list(set(avail_hs_codes) - existing_hs))
+        
+        if not target_hs:
+            print(f"   ✅ Tahun {year_str} sudah LENGKAP ({len(existing_hs)} codes). Skip.")
+            continue
+
+        batches = list(chunk_list(target_hs,BATCH_SIZE))
 
         for i,batch in enumerate(batches):
             hs_code_str = ",".join(batch)
