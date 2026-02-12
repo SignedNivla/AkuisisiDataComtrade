@@ -4,8 +4,10 @@ import requests
 
 from typing import Optional, Union
 
-from sqlalchemy import create_engine, Column, INTEGER,String,VARCHAR, Numeric, select
-from sqlalchemy.orm import declarative_base, sessionmaker, DeclarativeBase, Session
+import sqlalchemy as db
+from sqlalchemy.dialects import mysql
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 from pydantic import BaseModel, ValidationError, field_validator
 
@@ -20,8 +22,6 @@ from country_converter import CountryConverter
 import os
 
 import time
-
-from sqlalchemy import event
 # ---CONFIG & SETUP---
 
 load_dotenv()
@@ -29,15 +29,15 @@ coco = CountryConverter()
 
 # --DATABASE--
 DB_FILE = "trade_data.db"
-engine = create_engine(f'sqlite:///{DB_FILE}')
-Base:DeclarativeBase = declarative_base()
+engine = create_engine(os.getenv('TESTING_MY_SQL_URL',f'sqlite:///{DB_FILE}'),echo=True)
+Base = declarative_base()
 
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA synchronous=NORMAL")
-    cursor.close()
+# @event.listens_for(engine, "connect")
+# def set_sqlite_pragma(dbapi_connection, connection_record):
+#     cursor = dbapi_connection.cursor()
+#     cursor.execute("PRAGMA journal_mode=WAL")
+#     cursor.execute("PRAGMA synchronous=NORMAL")
+#     cursor.close()
 
 
 # --REQUEST API DECLARATION--
@@ -97,7 +97,10 @@ class CountryCodeConverter:
 
         if key in self._m49_cache:
             return self._m49_cache[key]
-        
+
+        if key == 'ALL':
+            return None
+
         if key == 'WLD':
             result = '0'
         else:
@@ -129,31 +132,29 @@ class CountryCodeConverter:
     
 # ---DATABASE SCHEMA---
 
-class Trade(Base):
-    __tablename__ = 'trade'
-    id = Column(INTEGER,primary_key=True, autoincrement=True)
+class TradeDB(Base):
+    __tablename__ = 'tbtrade'
 
-    kode_alpha3_reporter = Column(String(3),nullable=False)
-    kode_alpha3_partner= Column(String(3), nullable= False)
-
-    bulan= Column(VARCHAR(10), nullable = False)
-    tahun= Column(VARCHAR(4), nullable=False)
-    
-    id_sector= Column(VARCHAR(10),nullable=False)
-    hscode= Column(VARCHAR(20),nullable=False)
-    
-    vol= Column(VARCHAR(255))
-    satuan= Column(VARCHAR(255))
-    tarif = Column(Numeric(20,2))
-    nilai= Column(Numeric(20,2))
-    
-    kode_sumber= Column(String(3),nullable=False)
-    kode_flow = Column(String(1),nullable=False)
-
-    provinsi_reporter = Column(VARCHAR(255))
-    kota_reporter = Column(VARCHAR(255))
-    provinsi_partner = Column(VARCHAR(255))
-    kota_partner= Column(VARCHAR(255))
+    id = db.Column(mysql.INTEGER(11),primary_key=True,autoincrement=True)
+    kode_alpha3_reporter = db.Column(mysql.CHAR(3),nullable=True) #CHN
+    provinsi_reporter = db.Column(mysql.VARCHAR(255),nullable=True) #Belum ada sampai saat ini(pastikan null)
+    kota_reporter = db.Column(mysql.VARCHAR(255),nullable=True) #Belum ada sampai saat ini(pastikan null)
+    kode_alpha3_partner = db.Column(mysql.CHAR(3),nullable=True) #
+    provinsi_partner = db.Column(mysql.VARCHAR(255),nullable=True) #Belum ada sampai saat ini(pastikan null)
+    kota_partner = db.Column(mysql.VARCHAR(255),nullable=True) #Belum ada sampai saat ini(pastikan null)
+    bulan = db.Column(mysql.VARCHAR(15),nullable=True) #Belum ada sampai saat ini(pastikan null)
+    tahun = db.Column(mysql.YEAR,nullable=True) #2021
+    hscode = db.Column(mysql.VARCHAR(9),nullable=True) #911
+    id_sektor = db.Column(mysql.VARCHAR(15),nullable=True) #Belum ada sampai saat ini
+    vol = db.Column(mysql.BIGINT(),nullable=True) # 0/null
+    satuan = db.Column(mysql.VARCHAR(25),nullable=True) #Belum ada sampai saat ini
+    tarif = db.Column(mysql.DECIMAL(45,2),nullable=True,default=0.0) #Belum ada sampai saat ini(pastikan null)
+    nilai = db.Column(mysql.DECIMAL(45,2),nullable=True) #11.0
+    kode_sumber = db.Column(mysql.CHAR(2),nullable=True) #5
+    status = db.Column(mysql.VARCHAR(19),nullable=True) #export/import
+    berat_bersih = db.Column(mysql.DECIMAL(18,2),nullable=True) #1444220.0
+    pelabuhan = db.Column(mysql.VARCHAR(150),nullable=True) #Belum ada sampai saat ini(pastikan null)
+    hs_len = db.Column(mysql.TINYINT(3,unsigned = True)) #4
 
 # ---DATA CLEANING LAYER---
 
@@ -163,27 +164,19 @@ class TradeModel(BaseModel):
     sebelum disentuh oleh logika database.
     '''
     reporterCode:Union[int,str] #kode_alpha3_reporter
-
     partnerCode:Union[int,str] #kode_alpha3_partner
-
     refMonth:Union[int,str] #bulan
     refYear:Union[int,str] #tahun
-
-    classificationCode:str #hscode
-
-    cmdCode :str #id_sector
-
+    classificationCode:str #id_sektor
+    cmdCode :str #hscode
     qty:Optional[Union[float,str]] = None #vol
     qtyUnitCode:Optional[Union[str,int]] = None #satuan --> ubah jadi kg/g
     primaryValue:Optional[Union[str,float]] = None #tarif
     netWgt:Optional[Union[str,float]] = None #nilai
-
     provinsi_reporter:Optional[str] = None
     kota_reporter:Optional[str] = None
-
     provinsi_partner:Optional[str] = None
     kota_partner:Optional[str] = None
-
     kode_sumber:str = '5'
     flowCode:str
 
@@ -207,8 +200,8 @@ class TradeBatchProcessor:
     Class ini bertanggung jawab penuh atas siklus hidup
     pemrosesan satu batch data
     '''
-    def __init__(self, session:Session, mapper:CountryCodeConverter):
-        self.session = session
+    def __init__(self, db_session:Session, mapper:CountryCodeConverter):
+        self.db_session = db_session
         self.mapper = mapper
 
         self.total_processed = 0
@@ -245,22 +238,25 @@ class TradeBatchProcessor:
             part_iso = self.mapper.to_iso3(clean.partnerCode)
 
             return {
-                'kode_alpha3_reporter' : rep_iso,
-                'kode_alpha3_partner' : part_iso,
-                'bulan' : str(clean.refMonth).zfill(2),
-                'tahun' : str(clean.refYear),
-                'hscode' : clean.classificationCode,
-                'id_sector' : clean.cmdCode,
-                'vol' : str(clean.qty),
+                'kode_alpha3_reporter' : str(rep_iso),
+                'kode_alpha3_partner' : str(part_iso),
+                'bulan' : str(clean.refMonth).zfill(2) if clean.refMonth != None else None,
+                'tahun' : str(clean.refYear) if clean.refYear != None else None,
+                'hscode' : clean.cmdCode,
+                'id_sektor' : None,
+                'vol' : clean.qty if clean.qty != None else None,
                 'satuan' : clean.qtyUnitCode,
-                'tarif' : clean.primaryValue,
-                'nilai' : clean.netWgt,
+                'tarif' : 0.0,
+                'nilai' : clean.primaryValue,
                 'kode_sumber' : clean.kode_sumber,
-                'kode_flow' : clean.flowCode,
-                'provinsi_reporter' : clean.provinsi_reporter,
-                'kota_reporter' : clean.kota_reporter,
-                'provinsi_partner' : clean.provinsi_partner,
-                'kota_partner' : clean.kota_partner,
+                'status' : clean.flowCode,
+                'provinsi_reporter' : str(clean.provinsi_reporter) if clean.provinsi_partner != None else None,
+                'kota_reporter' : str(clean.kota_reporter) if clean.kota_reporter != None else None,
+                'provinsi_partner' : str(clean.provinsi_partner) if clean.provinsi_partner != None else None,
+                'kota_partner' : str(clean.kota_partner) if clean.kota_partner != None else None,
+                'berat_bersih': clean.netWgt if clean.netWgt != None else None,
+                'pelabuhan': None,
+                'hs_len':4
             }
         except ValidationError as e:
             self.errors.append(f'Validation Error: {str(e)}')
@@ -274,11 +270,11 @@ class TradeBatchProcessor:
         Logika penyimpanan data dan interaksi dengan database
         '''
         try:
-            self.session.bulk_insert_mappings(Trade,payload)
-            self.session.commit()
+            self.db_session.bulk_insert_mappings(TradeDB,payload)
+            self.db_session.commit()
             self.total_saved += len(payload)
         except Exception as e:
-            self.session.rollback()
+            self.db_session.rollback()
             self.errors.append(f'DB Insert Error:{str(e)}')
             print(f'CRITICAL: Batch failed to save! {e}')
 
@@ -296,9 +292,9 @@ def get_valid_hs4_codes():
     url = "https://comtradeapi.un.org/files/v1/app/reference/HS.json"
     
     try:
-        response = HTTP_SESSION.get(url)
+        response:requests.Response = HTTP_SESSION.get(url)
         response.raise_for_status()
-        data = response.json()
+        data:dict = response.json()
         
         valid_codes = []
         results = data.get('results', [])
@@ -325,8 +321,8 @@ class ComtradeClient:
     Client khusus untuk menangani komunikasi dengan UN Comtrade API
     '''
     BASE_URL = 'https://comtradeapi.un.org/data/v1/get/C/A/HS'
-    def __init__(self, session:Session, api_key:str):
-        self.session = session
+    def __init__(self, db_session:Session, api_key:str):
+        self.db_session = db_session
         self.api_key = api_key
 
         if not api_key:
@@ -349,13 +345,13 @@ class ComtradeClient:
             params["partnerCode"] = partner
 
         try:
-            response:requests.Response = self.session.get(self.BASE_URL,params=params,headers=headers)
+            response:requests.Response = self.db_session.get(self.BASE_URL,params=params,headers=headers)
 
             response.raise_for_status()
 
             data = response.json()
 
-            if 'error' in data:
+            if data.get('error') != "":
                 raise ComtradeAPIError(f"API Error message: {data['error']}")
             
             results = data.get('data',[])
@@ -378,11 +374,11 @@ class ComtradeClient:
             logger.error("Response is not valid JSON")
             raise ComtradeAPIError("Invalid JSON Response")
 
-def get_existing_code(db_session:Session,country_converter:CountryCodeConverter, reporter:str, year:str)->set[str]:
+def get_existing_code(db_session:Session,reporter:str, year:str)->set[str]:
         try:
-            stmt = select(Trade.id_sector).where(
-                Trade.kode_alpha3_reporter == country_converter.to_iso3(reporter),
-                Trade.tahun == year
+            stmt = select(TradeDB.hscode).where(
+                TradeDB.kode_alpha3_reporter == reporter,
+                TradeDB.tahun == year
             ).distinct()
             result = db_session.execute(stmt).scalars().all()
             return set(result)
@@ -430,9 +426,9 @@ def main():
         print(f'\nMEMPROSES TAHUN {year_str}')
         start_time = time.time()
 
-        BATCH_SIZE = 20
+        BATCH_SIZE = 500
 
-        existing_hs = get_existing_code(session,convert_country,reporters_env, year_str)
+        existing_hs = get_existing_code(session,reporters_env, year_str)
             
             # Set Difference: Apa yang kita mau - Apa yang sudah ada
         target_hs = sorted(list(set(avail_hs_codes) - existing_hs))
